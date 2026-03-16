@@ -44,7 +44,6 @@ export default function App() {
     const [isCheckingApiKey, setIsCheckingApiKey] = useState(true);
     const [hasApiKey, setHasApiKey] = useState(false);
     const [hasNtfyTopic, setHasNtfyTopic] = useState(false);
-    const [hasSeenTutorial, setHasSeenTutorial] = useState(false);
     const [showTutorial, setShowTutorial] = useState(false);
 
     async function refreshSetupState() {
@@ -56,12 +55,10 @@ export default function App() {
 
             setHasApiKey(apiKeySet);
             setHasNtfyTopic(ntfyTopicSet);
-            setHasSeenTutorial(seen);
             setShowTutorial(apiKeySet && !seen);
         } catch {
             setHasApiKey(false);
             setHasNtfyTopic(false);
-            setHasSeenTutorial(false);
             setShowTutorial(false);
         } finally {
             setIsCheckingApiKey(false);
@@ -79,7 +76,6 @@ export default function App() {
             setIsCheckingApiKey(true);
             setHasApiKey(false);
             setHasNtfyTopic(false);
-            setHasSeenTutorial(false);
             setShowTutorial(false);
         }
     }, [status]);
@@ -134,7 +130,6 @@ export default function App() {
             }
             {showTutorial && <TutorialModal onClose={() => {
                 api.post('/api/settings', { TUTORIAL_SEEN: 'true' }).catch(() => {});
-                setHasSeenTutorial(true);
                 setShowTutorial(false);
             }} />}
         </div>
