@@ -14,6 +14,7 @@ const WATCHDOG_INTERVAL    = 2 * 60 * 1000;
 const WATCHDOG_TIMEOUT     = 30 * 1000;
 const UNREAD_SYNC_INTERVAL = 30 * 1000;
 const SUPPORTED_VISION_MIME_TYPES = new Set(['image/jpeg', 'image/jpg', 'image/png']);
+const SHOW_TERMINAL_QR = (process.env.SHOW_TERMINAL_QR || 'false').toLowerCase() === 'true';
 
 // ── Pure utility helpers ──────────────────────────────────────────────────────
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
@@ -81,7 +82,58 @@ function isTargetClosedError(err) {
 
 function isSummarizeCommand(text) {
     const body = String(text || '').trim().toLowerCase();
-    return body.startsWith('!summarise') || body.startsWith('!summarize');
+    return body.startsWith('!summarise') || body.startsWith('!summarize') || body.startsWith('!summaries') || body.startsWith('!summarze');
+}
+
+function parseSummaryTimeWindow(text) {
+    const input = String(text || '').trim();
+    if (!input) return null;
+
+    const match = input.match(/^(.*?)(?:\s+)?last\s+(?:(\d+)\s+)?(minute|minutes|min|mins|hour|hours|hr|hrs|day|days|week|weeks|month|months)\s*$/i);
+    if (!match) return null;
+
+    const remaining = String(match[1] || '').trim();
+    const amount = Math.max(1, parseInt(match[2] || '1', 10));
+    const unitRaw = String(match[3] || '').toLowerCase();
+
+    let unitMs = 0;
+    let unitLabel = '';
+    if (['minute', 'minutes', 'min', 'mins'].includes(unitRaw)) {
+        unitMs = 60 * 1000;
+        unitLabel = amount === 1 ? 'minute' : 'minutes';
+    } else if (['hour', 'hours', 'hr', 'hrs'].includes(unitRaw)) {
+        unitMs = 60 * 60 * 1000;
+        unitLabel = amount === 1 ? 'hour' : 'hours';
+    } else if (['day', 'days'].includes(unitRaw)) {
+        unitMs = 24 * 60 * 60 * 1000;
+        unitLabel = amount === 1 ? 'day' : 'days';
+    } else if (['week', 'weeks'].includes(unitRaw)) {
+        unitMs = 7 * 24 * 60 * 60 * 1000;
+        unitLabel = amount === 1 ? 'week' : 'weeks';
+    } else if (['month', 'months'].includes(unitRaw)) {
+        unitMs = 30 * 24 * 60 * 60 * 1000;
+        unitLabel = amount === 1 ? 'month' : 'months';
+    }
+
+    if (!unitMs) return null;
+    return {
+        sinceMs: Date.now() - amount * unitMs,
+        label: `last ${amount} ${unitLabel}`,
+        remaining,
+    };
+}
+
+function messageTimestampMs(message) {
+    const ts = Number(message?.timestamp || 0);
+    if (!Number.isFinite(ts) || ts <= 0) return 0;
+    // whatsapp-web.js timestamps are usually epoch seconds.
+    return ts > 1_000_000_000_000 ? ts : ts * 1000;
+}
+
+function isNoImportantUpdatesSummary(text) {
+    const normalized = String(text || '').trim().toLowerCase();
+    return normalized === '- no important updates in this chat window.'
+        || normalized === 'no important updates in this chat window.';
 }
 
 function isGeneralCommand(text) {
@@ -324,6 +376,52 @@ export class WaUserSession {
         return null;
     }
 
+    async getGeneralMemoryLines(chatId) {
+        if (!chatId) return [];
+        const memory = await this.loadSummaryMemory();
+        const turns = memory?.chats?.[chatId]?.generalQa?.turns;
+        if (!Array.isArray(turns) || turns.length === 0) return [];
+
+        const maxTurns = Math.max(2, parseInt(this.getSetting('GENERAL_PERSISTENT_CONTEXT_TURNS', '12')) || 12);
+        const selected = turns.slice(-maxTurns);
+        const lines = [];
+        for (const t of selected) {
+            const sender = t?.sender || 'User';
+            const userText = String(t?.userText || '').trim();
+            const answerText = String(t?.answerText || '').trim();
+            if (userText) lines.push(`${sender}: ${userText}`);
+            if (answerText) lines.push(`Assistant: ${answerText}`);
+        }
+        return lines;
+    }
+
+    async rememberGeneralTurn({ chatId, chatName = '', sender = 'User', userText = '', answerText = '' }) {
+        if (!chatId) return;
+        const cleanUserText = String(userText || '').trim();
+        const cleanAnswerText = String(answerText || '').trim();
+        if (!cleanUserText && !cleanAnswerText) return;
+
+        const maxTurns = Math.max(10, parseInt(this.getSetting('GENERAL_PERSISTENT_MEMORY_TURNS', '60')) || 60);
+        await this.queueMemoryUpdate(async (memory) => {
+            const chats = memory.chats || (memory.chats = {});
+            const entry = chats[chatId] || { chatName: chatName || '', participants: [], summaries: [], updatedAt: null };
+            entry.chatName = chatName || entry.chatName;
+            const generalQa = entry.generalQa || { turns: [], updatedAt: null };
+            generalQa.turns = Array.isArray(generalQa.turns) ? generalQa.turns : [];
+            generalQa.turns.push({
+                at: new Date().toISOString(),
+                sender: String(sender || 'User'),
+                userText: cleanUserText,
+                answerText: cleanAnswerText,
+            });
+            generalQa.turns = generalQa.turns.slice(-maxTurns);
+            generalQa.updatedAt = new Date().toISOString();
+            entry.generalQa = generalQa;
+            entry.updatedAt = new Date().toISOString();
+            chats[chatId] = entry;
+        });
+    }
+
     formatMemoryForPrompt(chatMemory) {
         if (!chatMemory) return [];
         const lines = [];
@@ -518,6 +616,7 @@ export class WaUserSession {
     // ── Client factory ────────────────────────────────────────────────────────
     createAndBindClient() {
         const self = this;
+        let sessionIsAuthenticated = false;
         const c = new Client({
             authStrategy: new LocalAuth({ clientId: this.sessionId }),
             puppeteer: {
@@ -533,13 +632,26 @@ export class WaUserSession {
         });
 
         c.on('qr', qr => {
+            if (sessionIsAuthenticated) {
+                self.emit('info', '[QR] Ignoring late QR event because session is already authenticated.');
+                return;
+            }
             self.status = 'qr';
             self.qr = qr;
-            qrcode.generate(qr, { small: true });
+            if (SHOW_TERMINAL_QR) qrcode.generate(qr, { small: true });
             self.io.to(self.sessionId).emit('qr', qr);
         });
 
+        c.on('authenticated', () => {
+            sessionIsAuthenticated = true;
+            self.qr = null;
+            self.status = 'loading';
+            self.emit('success', '[STATUS] WhatsApp session authenticated');
+            self.io.to(self.sessionId).emit('status', 'loading');
+        });
+
         c.on('ready', () => {
+            sessionIsAuthenticated = true;
             self.status = 'connected';
             self.qr = null;
             self.emit('success', '[STATUS] WhatsApp client is ready');
@@ -576,12 +688,21 @@ export class WaUserSession {
     }
 
     // ── Summarise ─────────────────────────────────────────────────────────────
-    async summariseChat(chat, limit, detailed = false) {
+    async summariseChat(chat, limit, detailed = false, sinceMs = null, summarizeAllInWindow = false, timeWindowLabel = '') {
         const DEFAULT_LIMIT  = parseInt(this.getSetting('DEFAULT_MESSAGE_LIMIT', '50'));
         const safeLimit      = Math.max(1, parseInt(limit) || DEFAULT_LIMIT);
         const contextExtra   = Math.max(0, parseInt(this.getSetting('SUMMARY_CONTEXT_EXTRA', '30')));
         const CACHE_TTL      = parseInt(this.getSetting('SUMMARY_FETCH_CACHE_TTL_MS', '120000'));
         const fetchLimit     = safeLimit + contextExtra + 12;
+        const windowFetchLimit = Math.max(
+            fetchLimit,
+            parseInt(this.getSetting('SUMMARY_TIME_WINDOW_FETCH_LIMIT', '500')) || 500
+        );
+        const effectiveFetchLimit = sinceMs ? windowFetchLimit : fetchLimit;
+        const timeWindowMaxMessages = Math.max(
+            1,
+            parseInt(this.getSetting('SUMMARY_TIME_WINDOW_MAX_MESSAGES', '300')) || 300
+        );
 
         const chatId   = chat.id?._serialized;
         const chatName = chat.name || chat.id?.user || '';
@@ -593,39 +714,55 @@ export class WaUserSession {
         let rawFetchedCount = 0, afterCommandFilterCount = 0, selectedTargetMessageCount = 0;
 
         const latestMessageId = await this.getLatestMessageId(chat);
-        const runtimeCached = this.runtimeFetchCache.get(chatId);
-        if (runtimeCached
-            && Date.now() - runtimeCached.cachedAt <= CACHE_TTL
-            && runtimeCached.latestMessageId === latestMessageId
-            && runtimeCached.limit >= safeLimit) {
-            contextMessages = runtimeCached.contextMessages.slice(-contextExtra);
-            targetMessages  = runtimeCached.targetMessages.slice(-safeLimit);
-            selectedTargetMessageCount = targetMessages.length;
-            usedCache = true;
-        }
-
-        if (!usedCache && chatId) {
-            const persistedCache = await this.loadMessageCache(chatId);
-            if (persistedCache
-                && Date.now() - new Date(persistedCache.cachedAt || 0).getTime() <= CACHE_TTL
-                && persistedCache.latestMessageId === latestMessageId
-                && persistedCache.limit >= safeLimit) {
-                cachedContextLines = persistedCache.contextLines || [];
-                cachedTargetLines  = persistedCache.targetLines  || [];
+        if (!sinceMs) {
+            const runtimeCached = this.runtimeFetchCache.get(chatId);
+            if (runtimeCached
+                && Date.now() - runtimeCached.cachedAt <= CACHE_TTL
+                && runtimeCached.latestMessageId === latestMessageId
+                && runtimeCached.limit >= safeLimit) {
+                contextMessages = runtimeCached.contextMessages.slice(-contextExtra);
+                targetMessages  = runtimeCached.targetMessages.slice(-safeLimit);
+                selectedTargetMessageCount = targetMessages.length;
                 usedCache = true;
+            }
+
+            if (!usedCache && chatId) {
+                const persistedCache = await this.loadMessageCache(chatId);
+                if (persistedCache
+                    && Date.now() - new Date(persistedCache.cachedAt || 0).getTime() <= CACHE_TTL
+                    && persistedCache.latestMessageId === latestMessageId
+                    && persistedCache.limit >= safeLimit) {
+                    cachedContextLines = persistedCache.contextLines || [];
+                    cachedTargetLines  = persistedCache.targetLines  || [];
+                    usedCache = true;
+                }
             }
         }
 
         if (!usedCache) {
-            const allMessages = await withTimeout(chat.fetchMessages({ limit: fetchLimit }), 45_000, 'fetchMessages');
+            const allMessages = await withTimeout(chat.fetchMessages({ limit: effectiveFetchLimit }), 45_000, 'fetchMessages');
             rawFetchedCount = allMessages.length;
-            const filtered = allMessages.filter(m => !isSummarizeCommand(m.body || ''));
+            let filtered = allMessages.filter(m => !isSummarizeCommand(m.body || ''));
+            if (sinceMs) {
+                filtered = filtered.filter(m => {
+                    const tsMs = messageTimestampMs(m);
+                    return tsMs > 0 ? tsMs >= sinceMs : false;
+                });
+            }
+
             afterCommandFilterCount = filtered.length;
-            targetMessages  = filtered.slice(-safeLimit);
+            if (sinceMs && filtered.length === 0) {
+                const label = timeWindowLabel || 'requested time window';
+                throw new Error(`[NO_MESSAGES] No messages found for ${label}.`);
+            }
+
+            targetMessages  = sinceMs && summarizeAllInWindow
+                ? filtered.slice(-timeWindowMaxMessages)
+                : filtered.slice(-safeLimit);
             selectedTargetMessageCount = targetMessages.length;
             contextMessages = filtered.slice(0, Math.max(0, filtered.length - targetMessages.length)).slice(-contextExtra);
             const runtimePayload = { cachedAt: Date.now(), latestMessageId, limit: safeLimit, contextMessages, targetMessages };
-            if (chatId) this.runtimeFetchCache.set(chatId, runtimePayload);
+            if (chatId && !sinceMs) this.runtimeFetchCache.set(chatId, runtimePayload);
         }
 
         const MAX_MEDIA   = parseInt(this.getSetting('MAX_MEDIA_ANALYSIS_PER_SUMMARY', '12'));
@@ -689,6 +826,7 @@ export class WaUserSession {
         const message_collection = [...this.formatMemoryForPrompt(chatMemory), ...contextLines, ...targetLines];
         this.emit('info', `[STATUS] Messages fetched${usedCache ? ' (cache)' : ''} — target=${targetLines.length}, context=${contextLines.length}`);
         this.emit('info', `[STATUS] rawFetched=${rawFetchedCount || 'cache'}, afterFilter=${afterCommandFilterCount || 'cache'}, selected=${selectedTargetMessageCount}`);
+        if (sinceMs) this.emit('info', `[STATUS] Time window applied: ${timeWindowLabel || 'custom window'}`);
         this.emit('info', '[STATUS] Sending messages to AI...');
 
         const detailPrefix = detailed
@@ -706,9 +844,35 @@ export class WaUserSession {
             90_000, 'Groq API'
         );
 
-        const summary = sanitizeForWhatsApp(
+        let summary = sanitizeForWhatsApp(
             ai_response.choices[0].message.content.replace(/<think>.*?<\/think>/gs, '').trim()
         );
+
+        if (isNoImportantUpdatesSummary(summary)) {
+            this.emit('info', '[STATUS] Strict summary returned no-important-updates; retrying with relaxed recap prompt...');
+            const relaxed = await withTimeout(
+                this.getGroqClient().chat.completions.create({
+                    model: this.getSetting('GROQ_MODEL'),
+                    messages: [
+                        {
+                            role: 'system',
+                            content: 'Create a WhatsApp-friendly recap of the [SUMMARY TARGET] messages. Include normal conversation highlights, notable opinions, and any key moments even if no formal decision was made. Use short bullets. Do not say that there were no important updates.',
+                        },
+                        { role: 'user', content: message_collection.join('\n') },
+                    ],
+                    temperature: 0.2,
+                }),
+                90_000,
+                'Groq API relaxed recap'
+            );
+
+            const relaxedSummary = sanitizeForWhatsApp(
+                String(relaxed?.choices?.[0]?.message?.content || '')
+                    .replace(/<think>.*?<\/think>/gs, '')
+                    .trim()
+            );
+            if (relaxedSummary) summary = relaxedSummary;
+        }
 
         await this.rememberChatSummary({ chatId, chatName, participants: [...participantsSeen], summary });
         await this.rememberChatDirectory(chat, [...participantsSeen].map(p => {
@@ -748,17 +912,53 @@ export class WaUserSession {
     }
 
     // ── General Q&A ───────────────────────────────────────────────────────────
-    async answerGeneralQuestion(question) {
+    async buildGeneralContext(chat, currentMessageId = '') {
+        const contextLimit = Math.max(5, parseInt(this.getSetting('GENERAL_CONTEXT_MESSAGE_LIMIT', '30')) || 30);
+        const messages = await withTimeout(chat.fetchMessages({ limit: contextLimit + 8 }), 30_000, 'fetchMessages general context');
+
+        const lines = [];
+        for (const m of messages) {
+            const body = String(m?.body || '').trim();
+            if (!body) continue;
+            if (isGeneralCommand(body) || isSummarizeCommand(body)) continue;
+            if (currentMessageId && messageIdOf(m) === currentMessageId) continue;
+
+            let who = 'User';
+            if (m.fromMe) {
+                who = 'Me';
+            } else if (chat?.isGroup) {
+                const phone = extractPhoneFromJid(m.author || m.from);
+                who = phone ? `Participant ${phone}` : 'Participant';
+            }
+            lines.push(`${who}: ${body}`);
+        }
+        return lines.slice(-contextLimit);
+    }
+
+    async answerGeneralQuestion(question, chat = null, currentMessageId = '') {
         const prompt = String(question || '').trim();
         if (!prompt) return 'Usage: !general <your question>';
         const targetWordCount = extractRequestedWordCount(prompt);
+
+        let contextLines = [];
+        let persistentLines = [];
+        if (chat) {
+            try { contextLines = await this.buildGeneralContext(chat, currentMessageId); }
+            catch (err) { this.emit('error', '[GENERAL CONTEXT ERROR] ' + err.message); }
+            try { persistentLines = await this.getGeneralMemoryLines(chat.id?._serialized || ''); }
+            catch (err) { this.emit('error', '[GENERAL MEMORY READ ERROR] ' + err.message); }
+        }
+
+        const userPrompt = (persistentLines.length > 0 || contextLines.length > 0)
+            ? `${persistentLines.length > 0 ? `Persistent memory from previous general chats (oldest to newest):\n${persistentLines.join('\n')}\n\n` : ''}${contextLines.length > 0 ? `Recent chat context (oldest to newest):\n${contextLines.join('\n')}\n\n` : ''}Current question: ${prompt}`
+            : prompt;
 
         const ai_response = await withTimeout(
             this.getGroqClient().chat.completions.create({
                 model: this.getSetting('GROQ_MODEL'),
                 messages: [
-                    { role: 'system', content: 'Answer the user question directly. Output only the answer text with no preamble, no labels, and no extra commentary.' },
-                    { role: 'user',   content: prompt },
+                    { role: 'system', content: 'Answer the user question directly. Use recent chat context when it is relevant. If context is missing, say so briefly. Output only the answer text with no preamble, no labels, and no extra commentary.' },
+                    { role: 'user',   content: userPrompt },
                 ],
                 temperature: 0.2,
             }),
@@ -797,8 +997,15 @@ export class WaUserSession {
     }
 
     // ── Command gating ────────────────────────────────────────────────────────
-    isCommandAllowedForMessage(msg) {
+    isCommandAllowedForMessage(msg, chat = null) {
         if (msg?.fromMe) return true;
+
+        // In group chats, allow any participant to run bot commands.
+        if (chat?.isGroup) return true;
+
+        // In direct chats, allow any sender to run bot commands.
+        if (chat && !chat.isGroup) return true;
+
         const ALLOW_PUBLIC = (process.env.ALLOW_PUBLIC_COMMANDS || 'false').toLowerCase() === 'true';
         if (!ALLOW_PUBLIC) return false;
         const ALLOWED_PHONES = new Set(
@@ -848,21 +1055,22 @@ export class WaUserSession {
                     const unread     = Number(latestChat.unreadCount || 0);
                     const bucket     = Math.floor(unread / AUTO_THRESHOLD);
                     const lastBucket = this.unreadSummaryBuckets.get(id) || 0;
-                    this.emit('info', `[AUTO] "${latestChat.name || chat.name}" unreadCount: ${unread}/${AUTO_THRESHOLD}`);
-                    if (bucket === 0) { if (lastBucket !== 0) this.unreadSummaryBuckets.set(id, 0); return; }
-                    if (bucket <= lastBucket) return;
-                    this.unreadSummaryBuckets.set(id, bucket);
-                    this.emit('info', `[AUTO] Threshold hit for "${latestChat.name || chat.name}" (unread=${unread}) — generating summary...`);
-                    try {
-                        const summary = await withTimeout(
-                            this.summariseChat(latestChat, AUTO_THRESHOLD), 120_000, 'summariseChat auto'
-                        );
-                        const ntfyText = `📋 ${latestChat.name || chat.name}\n\n${summary}`;
-                        await withTimeout(this.sendNtfy(ntfyText), 20_000, 'sendNtfy auto');
-                        this.io.to(this.sessionId).emit('summary_done', summary);
-                    } catch (err) {
-                        this.unreadSummaryBuckets.set(id, Math.max(0, bucket - 1));
-                        this.emit('error', '[AUTO ERROR] ' + err.message);
+                    if (bucket === 0) {
+                        if (lastBucket !== 0) this.unreadSummaryBuckets.set(id, 0);
+                    } else if (bucket > lastBucket) {
+                        this.unreadSummaryBuckets.set(id, bucket);
+                        this.emit('info', `[AUTO] Threshold hit for "${latestChat.name || chat.name}" (unread=${unread}) — generating summary...`);
+                        try {
+                            const summary = await withTimeout(
+                                this.summariseChat(latestChat, AUTO_THRESHOLD), 120_000, 'summariseChat auto'
+                            );
+                            const ntfyText = `📋 ${latestChat.name || chat.name}\n\n${summary}`;
+                            await withTimeout(this.sendNtfy(ntfyText), 20_000, 'sendNtfy auto');
+                            this.io.to(this.sessionId).emit('summary_done', summary);
+                        } catch (err) {
+                            this.unreadSummaryBuckets.set(id, Math.max(0, bucket - 1));
+                            this.emit('error', '[AUTO ERROR] ' + err.message);
+                        }
                     }
                 }
             }
@@ -874,36 +1082,73 @@ export class WaUserSession {
                 } catch {}
             }
 
-            if (isGeneralCommand(msg.body) && this.isCommandAllowedForMessage(msg)) {
+            if (isGeneralCommand(msg.body)) {
                 try {
                     const replyChat = await withTimeout(msg.getChat(), 15_000, 'getChat general reply');
+                    if (!this.isCommandAllowedForMessage(msg, replyChat)) return;
                     const question  = String(msg.body || '').trim().slice('!general'.length).trim();
-                    const answer    = await this.answerGeneralQuestion(question);
+                    try { await replyChat.sendStateTyping(); } catch {}
+                    const answer    = await this.answerGeneralQuestion(question, replyChat, messageIdOf(msg));
+                    try { await replyChat.clearState(); } catch {}
                     await withTimeout(replyChat.sendMessage(answer), 20_000, 'sendMessage general');
+
+                    const senderPhone = extractPhoneFromJid(msg.author || msg.from);
+                    const senderLabel = senderPhone ? `User ${senderPhone}` : 'User';
+                    await this.rememberGeneralTurn({
+                        chatId: replyChat.id?._serialized || '',
+                        chatName: replyChat.name || replyChat.id?.user || '',
+                        sender: senderLabel,
+                        userText: question,
+                        answerText: answer,
+                    });
                 } catch (err) { this.emit('error', '[GENERAL ERROR] ' + err.message); }
                 return;
             }
 
-            if (isSummarizeCommand(msg.body) && this.isCommandAllowedForMessage(msg)) {
+            if (isSummarizeCommand(msg.body)) {
                 const raw      = msg.body;
                 const detailed = raw.trimEnd().toLowerCase().endsWith(' detail');
                 const stripped = detailed ? raw.trimEnd().slice(0, -7).trimEnd() : raw;
-                const parts    = stripped.split(' ');
-                const secondArg = parts[1];
-                let targetChat, number_of_messages;
-                const replyChat = await withTimeout(msg.getChat(), 15_000, 'getChat cmd reply');
+                const commandBody = stripped.replace(/^\S+\s*/, '').trim();
+                const timeWindow = parseSummaryTimeWindow(commandBody);
+                const commandBodyWithoutWindow = timeWindow ? timeWindow.remaining : commandBody;
+                const parts = commandBodyWithoutWindow ? commandBodyWithoutWindow.split(/\s+/) : [];
 
-                if (!secondArg) {
+                let targetChat, number_of_messages;
+                let groupName = '';
+                let explicitLimit = null;
+                const defaultMessageLimit = parseInt(this.getSetting('DEFAULT_MESSAGE_LIMIT', '50'));
+                const replyChat = await withTimeout(msg.getChat(), 15_000, 'getChat cmd reply');
+                if (!this.isCommandAllowedForMessage(msg, replyChat)) return;
+
+                if (parts.length === 1 && !isNaN(parts[0])) {
+                    explicitLimit = parseInt(parts[0], 10);
+                }
+
+                if (!commandBodyWithoutWindow) {
                     targetChat = replyChat;
-                    number_of_messages = parseInt(this.getSetting('DEFAULT_MESSAGE_LIMIT', '50'));
-                } else if (!isNaN(secondArg)) {
+                    number_of_messages = defaultMessageLimit;
+                } else if (explicitLimit !== null) {
                     targetChat = replyChat;
-                    number_of_messages = parseInt(secondArg);
+                    number_of_messages = explicitLimit;
                 } else {
-                    const lastArg  = parts[parts.length - 1];
-                    const hasCount = !isNaN(lastArg) && parts.length > 2;
-                    number_of_messages = hasCount ? parseInt(lastArg) : parseInt(this.getSetting('DEFAULT_MESSAGE_LIMIT', '50'));
-                    const groupName    = hasCount ? parts.slice(1, -1).join(' ') : parts.slice(1).join(' ');
+                    const lastArg = parts[parts.length - 1];
+                    const hasCount = !isNaN(lastArg) && parts.length > 1;
+                    number_of_messages = hasCount ? parseInt(lastArg, 10) : defaultMessageLimit;
+                    groupName = hasCount ? parts.slice(0, -1).join(' ') : commandBodyWithoutWindow;
+                }
+
+                // Only the bot owner (fromMe) can target a named chat/group.
+                if (!msg.fromMe && groupName) {
+                    await withTimeout(
+                        replyChat.sendMessage('You can only summarize this current chat. Targeting another chat by name is not allowed.'),
+                        20_000,
+                        'sendMessage cmd denied'
+                    );
+                    return;
+                }
+
+                if (groupName) {
                     this.emit('info', `[STATUS] Searching for chat: "${groupName}"`);
                     targetChat = await this.findChatByNameFromMemory(c, groupName);
                     if (!targetChat) {
@@ -917,12 +1162,32 @@ export class WaUserSession {
                 }
 
                 try {
+                    const summarizeAllInWindow = !!timeWindow && explicitLimit === null;
+                    try { await replyChat.sendStateTyping(); } catch {}
                     const summary = await withTimeout(
-                        this.summariseChat(targetChat, number_of_messages, detailed), 120_000, 'summariseChat cmd'
+                        this.summariseChat(
+                            targetChat,
+                            number_of_messages,
+                            detailed,
+                            timeWindow?.sinceMs || null,
+                            summarizeAllInWindow,
+                            timeWindow?.label || ''
+                        ),
+                        120_000,
+                        'summariseChat cmd'
                     );
+                    try { await replyChat.clearState(); } catch {}
                     await withTimeout(replyChat.sendMessage(summary), 20_000, 'sendMessage cmd');
                     this.io.to(this.sessionId).emit('summary_done', summary);
-                } catch (err) { this.emit('error', '[ERROR] ' + err.message); }
+                } catch (err) {
+                    this.emit('error', '[ERROR] ' + err.message);
+                    if (String(err?.message || '').includes('[NO_MESSAGES]')) {
+                        try {
+                            const label = timeWindow?.label || 'the requested time range';
+                            await withTimeout(replyChat.sendMessage(`No messages found in ${label}.`), 20_000, 'sendMessage no messages');
+                        } catch {}
+                    }
+                }
             }
         });
     }
