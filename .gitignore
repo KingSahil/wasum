@@ -1,0 +1,12 @@
+node_modules
+package-lock.json
+.wwebjs_auth/
+.wwebjs_cache
+.env
+.env.azure
+data/summary-memory.json
+data/users/
+dist/
+logs/wa-summariser.log
+server.log
+deploy.tgz

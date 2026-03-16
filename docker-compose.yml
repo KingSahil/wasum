@@ -1,0 +1,17 @@
+services:
+  app:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    volumes:
+      - wa_session:/app/.wwebjs_auth
+      - wa_data:/app/data
+      - ./.env:/app/.env
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
+
+volumes:
+  wa_session:
+  wa_data:

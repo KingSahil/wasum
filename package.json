@@ -1,0 +1,53 @@
+{
+  "name": "wa-chat-summariser",
+  "version": "1.0.0",
+  "description": "- iOS 18.3 update brings Apple Intelligence features to iPhone - In a move to bring the much awaited AI-enabled features to the iPhone, Apple rushes prototypes into production. - The result: insert images here - The result: Apple rolls back Apple Intelligence features not even n months after releasing them!",
+  "main": "backend/server.js",
+  "scripts": {
+    "start": "node backend/server.js",
+    "dev:server": "node backend/server.js",
+    "dev:client": "cd frontend && npm run dev",
+    "build": "cd frontend && npm run build",
+    "test": "node backend/server.js",
+    "build:bundle": "node scripts/build.js",
+    "build:exe": "npm run build && npm run build:bundle && npx @yao-pkg/pkg scripts/entry.cjs --targets node20-win-x64 --output dist/wa-summariser.exe",
+    "package": "npx @yao-pkg/pkg scripts/entry.cjs --targets node20-win-x64 --output dist/wa-summariser.exe"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/syswraith/wa-chat-summariser.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "bugs": {
+    "url": "https://github.com/syswraith/wa-chat-summariser/issues"
+  },
+  "homepage": "https://github.com/syswraith/wa-chat-summariser#readme",
+  "pkg": {
+    "assets": [
+      "dist/system_prompt.txt",
+      "dist/frontend/**/*"
+    ],
+    "scripts": []
+  },
+  "devDependencies": {
+    "@yao-pkg/pkg": "^5.16.1",
+    "esbuild": "^0.25.12"
+  },
+  "dependencies": {
+    "axios": "^1.7.9",
+    "cors": "^2.8.6",
+    "dotenv": "^17.3.1",
+    "express": "^5.2.1",
+    "groq-sdk": "^0.37.0",
+    "ollama": "^0.5.12",
+    "qrcode-terminal": "^0.12.0",
+    "socket.io": "^4.8.3",
+    "whatsapp-web.js": "^1.26.0"
+  },
+  "overrides": {
+    "yauzl": "3.2.1"
+  }
+}
