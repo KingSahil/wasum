@@ -1,3 +1,5 @@
+
+![App Screenshot](image.png)
 # WA Chat Summariser
 
 WhatsApp chat summariser built with a React frontend and a Node.js backend.
