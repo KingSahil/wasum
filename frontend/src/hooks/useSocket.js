@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useState } from 'react';
 import { io } from 'socket.io-client';
 
 // In dev: proxy handles routing to localhost:3000
@@ -10,12 +10,10 @@ export function useSocket(sessionId) {
     const [qr, setQr] = useState(null);
     const [logs, setLogs] = useState([]);
     const [summary, setSummary] = useState(null);
-    const socketRef = useRef(null);
 
     useEffect(() => {
         if (!sessionId) return;
         const socket = io(BACKEND, { path: '/socket.io', auth: { sessionId } });
-        socketRef.current = socket;
 
         socket.on('status', s => setStatus(s));
         socket.on('qr', q => { setQr(q); setStatus('qr'); });
@@ -24,7 +22,7 @@ export function useSocket(sessionId) {
         socket.on('summary_done', s => setSummary(s));
 
         return () => socket.disconnect();
-    }, []);
+    }, [sessionId]);
 
-    return { status, qr, logs, summary, setSummary, socket: socketRef.current };
+    return { status, qr, logs, summary, setSummary };
 }

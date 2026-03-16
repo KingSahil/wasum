@@ -21,8 +21,8 @@ wa-chat-summariser-main/
     package.json
   data/
     sessions.json
-    users/
-  dist/
+    users/            # runtime-only (gitignored)
+  dist/               # build output (gitignored)
   scripts/
     build.js
     build-exe.bat
@@ -151,3 +151,4 @@ Service runs on `http://localhost:3000`.
 - Session/auth data is stored under `.wwebjs_auth/` and `data/`.
 - Frontend build output is `frontend/dist`.
 - The root server always serves static files from the built frontend output.
+- `dist/` and `data/users/` are local runtime/generated artifacts and are not committed.
