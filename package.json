@@ -4,16 +4,17 @@
   "description": "- iOS 18.3 update brings Apple Intelligence features to iPhone - In a move to bring the much awaited AI-enabled features to the iPhone, Apple rushes prototypes into production. - The result: insert images here - The result: Apple rolls back Apple Intelligence features not even n months after releasing them!",
   "main": "backend/server.js",
   "scripts": {
-    "start": "node backend/server.js",
-    "dev:server": "node backend/server.js",
-    "dev:client": "cd frontend && npm run dev",
-    "build": "cd frontend && npm run build",
-    "test": "node backend/server.js",
-    "build:bundle": "node scripts/build.js",
-    "build:exe": "npm run build && npm run build:bundle && npx @yao-pkg/pkg scripts/entry.cjs --targets node20-win-x64 --output dist/wa-summariser.exe",
-    "package": "npx @yao-pkg/pkg scripts/entry.cjs --targets node20-win-x64 --output dist/wa-summariser.exe"
+    "start": "bun backend/server.js",
+    "dev:server": "bun backend/server.js",
+    "dev:client": "cd frontend && bun run dev",
+    "build": "cd frontend && bun run build",
+    "test": "bun backend/server.js",
+    "build:bundle": "bun scripts/build.js",
+    "build:exe": "bun run build && bun run build:bundle && bunx @yao-pkg/pkg scripts/entry.cjs --targets node20-win-x64 --output dist/wa-summariser.exe",
+    "package": "bunx @yao-pkg/pkg scripts/entry.cjs --targets node20-win-x64 --output dist/wa-summariser.exe"
   },
-  "repository": {
+
+  "repository": { 
     "type": "git",
     "url": "git+https://github.com/syswraith/wa-chat-summariser.git"
   },
