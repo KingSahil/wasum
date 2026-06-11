@@ -19,9 +19,7 @@ export default function ChatPanel({ chat, logs, summary, setSummary }) {
         setError(null);
         setSummary(null);
         try {
-            const res = await api.post('/api/summarise', { chatId: chat.id, limit });
-            const data = await res.json();
-            if (!res.ok) throw new Error(data.error || 'Failed');
+            const data = await api.post('/api/summarise', { chatId: chat.id, limit });
             setSummary(data.summary);
         } catch (err) {
             setError(err.message);

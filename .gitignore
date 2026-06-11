@@ -9,3 +9,5 @@ dist/
 logs/wa-summariser.log
 server.log
 deploy.tgz
+data
+data/sessions.json

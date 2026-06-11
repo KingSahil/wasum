@@ -7,12 +7,13 @@ import { readFile, writeFile, unlink, mkdir, appendFile, rm } from 'fs/promises'
 import { join, dirname } from 'path';
 import systemPrompt from './generated-prompt.cjs';
 
-const { Client, LocalAuth } = pkg;
+const { Client, LocalAuth, Message } = pkg;
 
 // ── Module-level constants (system-wide, not per-user) ────────────────────────
 const WATCHDOG_INTERVAL    = 2 * 60 * 1000;
 const WATCHDOG_TIMEOUT     = 30 * 1000;
-const UNREAD_SYNC_INTERVAL = 30 * 1000;
+const UNREAD_SYNC_INTERVAL = 60 * 1000;
+const DEFAULT_GROQ_MODEL    = 'llama-3.3-70b-versatile';
 const SUPPORTED_VISION_MIME_TYPES = new Set(['image/jpeg', 'image/jpg', 'image/png']);
 const SHOW_TERMINAL_QR = (process.env.SHOW_TERMINAL_QR || 'false').toLowerCase() === 'true';
 
@@ -33,6 +34,17 @@ function withTimeout(promise, ms, label = '') {
         );
     });
     return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+function errorMessage(err) {
+    return err instanceof Error ? err.message : String(err || 'Unknown error');
+}
+
+function isBrokenChatHistoryError(err) {
+    const message = errorMessage(err).toLowerCase();
+    return message.includes('waitforchatloading')
+        || message.includes('conversationmsgs')
+        || message.includes('loadearliermsgs');
 }
 
 function sanitizeForWhatsApp(text) {
@@ -176,6 +188,8 @@ export class WaUserSession {
         this.unreadSyncTimer     = null;
         this.restartTimer        = null;
         this.restarting          = false;
+        this.unreadSyncInProgress = false;
+        this.unreadSyncFailures  = 0;
         this.unreadSummaryBuckets = new Map();
         this.runtimeFetchCache   = new Map();
         this.memoryWriteQueue    = Promise.resolve();
@@ -198,7 +212,7 @@ export class WaUserSession {
         return {
             GROQ_API_KEY:          this.getSetting('GROQ_API_KEY') ? '***' : '',
             GROQ_API_KEY_SET:      Boolean(this.getSetting('GROQ_API_KEY')),
-            GROQ_MODEL:            this.getSetting('GROQ_MODEL'),
+            GROQ_MODEL:            this.getGroqModel(),
             NTFY_TOPIC:            this.getSetting('NTFY_TOPIC'),
             NTFY_TOPIC_SET:        Boolean(this.getSetting('NTFY_TOPIC')),
             TUTORIAL_SEEN:         this.userSettings.TUTORIAL_SEEN === 'true',
@@ -251,6 +265,10 @@ export class WaUserSession {
             this.groqKey = apiKey;
         }
         return this.groq;
+    }
+
+    getGroqModel() {
+        return String(this.getSetting('GROQ_MODEL', DEFAULT_GROQ_MODEL) || DEFAULT_GROQ_MODEL).trim();
     }
 
     // ── Logging ───────────────────────────────────────────────────────────────
@@ -530,10 +548,12 @@ export class WaUserSession {
     }
 
     async syncUnreadSummaryBuckets() {
-        if (this.status !== 'connected' || this.restarting) return;
+        if (this.status !== 'connected' || this.restarting || this.unreadSyncInProgress) return;
+        this.unreadSyncInProgress = true;
         const AUTO_THRESHOLD = parseInt(this.getSetting('AUTO_SUMMARY_THRESHOLD', '100'));
         try {
             const chats = await withTimeout(this.client.getChats(), 30_000, 'sync unread getChats');
+            this.unreadSyncFailures = 0;
             for (const chat of chats) {
                 if (!chat.isGroup) continue;
                 const chatId = chat.id?._serialized;
@@ -550,7 +570,14 @@ export class WaUserSession {
             }
         } catch (err) {
             if (this.restarting || isTargetClosedError(err)) return;
-            this.emit('error', `[AUTO] Failed syncing unread counts: ${err.message}`);
+            this.unreadSyncFailures++;
+            this.emit('error', `[AUTO] Failed syncing unread counts: ${errorMessage(err)}`);
+            if (this.unreadSyncFailures >= 2) {
+                this.emit('error', '[AUTO] Unread sync failed twice; restarting the stale WhatsApp client...');
+                this.restartClient('AUTO');
+            }
+        } finally {
+            this.unreadSyncInProgress = false;
         }
     }
 
@@ -572,14 +599,18 @@ export class WaUserSession {
     }
 
     beginClientInitialisation(source = 'INIT') {
+        const client = this.client;
         this.cleanupChromiumSingletonFiles().finally(() =>
-            this.client.initialize().catch(err => {
-                const detail = isTargetClosedError(err)
-                    ? `${err.message} — Chromium navigated during WhatsApp boot`
-                    : err.message;
-                this.emit('error', `[${source}] initialize() failed: ${detail} — retrying in 10 s...`);
-                this.scheduleRestart(source, 10_000);
-            })
+            client.initialize()
+                .then(() => client.armNavigationInjectionRecovery?.())
+                .catch(err => {
+                    const message = errorMessage(err);
+                    const detail = isTargetClosedError(err)
+                        ? `${message} — Chromium navigated during WhatsApp boot`
+                        : message;
+                    this.emit('error', `[${source}] initialize() failed: ${detail} — retrying in 10 s...`);
+                    this.scheduleRestart(source, 10_000);
+                })
         );
     }
 
@@ -592,6 +623,8 @@ export class WaUserSession {
             this.restartTimer = null;
         }
         this.status = 'loading';
+        this.unreadSyncInProgress = false;
+        this.unreadSyncFailures = 0;
         this.emit('error', `[${source}] Destroying stale client...`);
 
         if (this.watchdogTimer) { clearInterval(this.watchdogTimer); this.watchdogTimer = null; }
@@ -630,6 +663,25 @@ export class WaUserSession {
                 ],
             },
         });
+
+        // whatsapp-web.js leaves errors from its async navigation reinjection
+        // unhandled. Initial failures still reject initialize(); later failures
+        // restart this session instead of terminating the Node process.
+        const inject = c.inject.bind(c);
+        let recoverNavigationInjection = false;
+        c.armNavigationInjectionRecovery = () => {
+            recoverNavigationInjection = true;
+        };
+        c.inject = async (...args) => {
+            try {
+                return await inject(...args);
+            } catch (err) {
+                if (!recoverNavigationInjection) throw err;
+                self.emit('error', `[PUPPETEER] WhatsApp reinjection failed: ${errorMessage(err)} — restarting...`);
+                self.restartClient('PUPPETEER');
+                return undefined;
+            }
+        };
 
         c.on('qr', qr => {
             if (sessionIsAuthenticated) {
@@ -687,6 +739,46 @@ export class WaUserSession {
         return c;
     }
 
+    async getChatById(chatId) {
+        if (!chatId || !this.client) return null;
+        return withTimeout(this.client.getChatById(chatId), 20_000, 'getChatById');
+    }
+
+    async fetchMessages(chat, searchOptions, label = 'fetchMessages') {
+        try {
+            return await withTimeout(chat.fetchMessages(searchOptions), 45_000, label);
+        } catch (err) {
+            if (!isBrokenChatHistoryError(err)) throw err;
+
+            const chatId = chat?.id?._serialized;
+            if (!chatId || !this.client?.pupPage) throw err;
+
+            this.emit('error', `[WHATSAPP] Older-message loader is unavailable; using cached messages for "${chat.name || chat.id?.user || chatId}".`);
+            const messageModels = await withTimeout(
+                this.client.pupPage.evaluate((id, options) => {
+                    const cachedChat = window.Store?.Chat?.get?.(id);
+                    if (!cachedChat?.msgs) return [];
+
+                    let messages = cachedChat.msgs.getModelsArray().filter(message => {
+                        if (message.isNotification) return false;
+                        if (options?.fromMe !== undefined && message.id.fromMe !== options.fromMe) return false;
+                        return true;
+                    });
+
+                    messages.sort((a, b) => Number(a.t || 0) - Number(b.t || 0));
+                    const limit = Number(options?.limit || 0);
+                    if (limit > 0) messages = messages.slice(-limit);
+                    return messages.map(message => window.WWebJS.getMessageModel(message));
+                }, chatId, searchOptions || {}),
+                15_000,
+                `${label} cached fallback`
+            );
+
+            if (!Array.isArray(messageModels) || messageModels.length === 0) throw err;
+            return messageModels.map(data => new Message(this.client, data));
+        }
+    }
+
     // ── Summarise ─────────────────────────────────────────────────────────────
     async summariseChat(chat, limit, detailed = false, sinceMs = null, summarizeAllInWindow = false, timeWindowLabel = '') {
         const DEFAULT_LIMIT  = parseInt(this.getSetting('DEFAULT_MESSAGE_LIMIT', '50'));
@@ -740,7 +832,7 @@ export class WaUserSession {
         }
 
         if (!usedCache) {
-            const allMessages = await withTimeout(chat.fetchMessages({ limit: effectiveFetchLimit }), 45_000, 'fetchMessages');
+            const allMessages = await this.fetchMessages(chat, { limit: effectiveFetchLimit }, 'fetchMessages');
             rawFetchedCount = allMessages.length;
             let filtered = allMessages.filter(m => !isSummarizeCommand(m.body || ''));
             if (sinceMs) {
@@ -835,7 +927,7 @@ export class WaUserSession {
 
         const ai_response = await withTimeout(
             this.getGroqClient().chat.completions.create({
-                model: this.getSetting('GROQ_MODEL'),
+                model: this.getGroqModel(),
                 messages: [
                     { role: 'system', content: detailPrefix + systemPrompt.trim() },
                     { role: 'user',   content: message_collection.join('\n') },
@@ -852,7 +944,7 @@ export class WaUserSession {
             this.emit('info', '[STATUS] Strict summary returned no-important-updates; retrying with relaxed recap prompt...');
             const relaxed = await withTimeout(
                 this.getGroqClient().chat.completions.create({
-                    model: this.getSetting('GROQ_MODEL'),
+                    model: this.getGroqModel(),
                     messages: [
                         {
                             role: 'system',
@@ -886,7 +978,7 @@ export class WaUserSession {
 
     async getLatestMessageId(chat) {
         try {
-            const latest = await withTimeout(chat.fetchMessages({ limit: 1 }), 12_000, 'fetchMessages latest');
+            const latest = await this.fetchMessages(chat, { limit: 1 }, 'fetchMessages latest');
             return latest?.[0] ? messageIdOf(latest[0]) : '';
         } catch { return ''; }
     }
@@ -914,7 +1006,7 @@ export class WaUserSession {
     // ── General Q&A ───────────────────────────────────────────────────────────
     async buildGeneralContext(chat, currentMessageId = '') {
         const contextLimit = Math.max(5, parseInt(this.getSetting('GENERAL_CONTEXT_MESSAGE_LIMIT', '30')) || 30);
-        const messages = await withTimeout(chat.fetchMessages({ limit: contextLimit + 8 }), 30_000, 'fetchMessages general context');
+        const messages = await this.fetchMessages(chat, { limit: contextLimit + 8 }, 'fetchMessages general context');
 
         const lines = [];
         for (const m of messages) {
@@ -955,7 +1047,7 @@ export class WaUserSession {
 
         const ai_response = await withTimeout(
             this.getGroqClient().chat.completions.create({
-                model: this.getSetting('GROQ_MODEL'),
+                model: this.getGroqModel(),
                 messages: [
                     { role: 'system', content: 'Answer the user question directly. Use recent chat context when it is relevant. If context is missing, say so briefly. Output only the answer text with no preamble, no labels, and no extra commentary.' },
                     { role: 'user',   content: userPrompt },
@@ -976,7 +1068,7 @@ export class WaUserSession {
                 try {
                     const rewrite = await withTimeout(
                         this.getGroqClient().chat.completions.create({
-                            model: this.getSetting('GROQ_MODEL'),
+                            model: this.getGroqModel(),
                             messages: [
                                 { role: 'system', content: `Rewrite the answer so it contains exactly ${targetWordCount} words. Return only the rewritten answer text.` },
                                 { role: 'user',   content: answer },

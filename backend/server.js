@@ -117,15 +117,18 @@ app.post('/api/summarise', requireSession, async (req, res) => {
     try {
         const { chatId, limit = 50 } = req.body;
         if (!chatId) return res.status(400).json({ error: 'chatId required' });
-        const chats = await req.session.client.getChats();
-        const chat = chats.find(c => c.id._serialized === chatId);
+        const { status } = req.session.getStatus();
+        if (status !== 'connected') return res.status(503).json({ error: 'WhatsApp not connected yet' });
+        const chat = await req.session.getChatById(chatId);
         if (!chat) return res.status(404).json({ error: 'Chat not found' });
         const summary = await req.session.summariseChat(chat, parseInt(limit));
         await req.session.sendNtfy(summary);
         io.to(req.session.sessionId).emit('summary_done', summary);
         res.json({ summary });
     } catch (err) {
-        res.status(500).json({ error: err.message });
+        const message = err instanceof Error ? err.message : String(err || 'Unknown error');
+        req.session.emit('error', `[API] Summarise failed: ${message}`);
+        res.status(500).json({ error: message });
     }
 });
 
